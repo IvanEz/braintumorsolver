@@ -2,6 +2,7 @@
 # coding: utf-8
 import numpy as np
 import os
+import copy
 import random
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 import torch
@@ -118,17 +119,17 @@ def get_diff_operator(dx):
             [1.0 / delx, 1.0 / dely, 1.0 / delz, 1.0 / (delx ** 2), 1.0 / (dely ** 2), 1.0 / (delz ** 2)]
             )).type(torch.FloatTensor)
         
-    return Filter_var, Filter_var_d, dx_, d_
+    return Filter_var, Filter_var_d, dx_.view(1, -1, 1, 1, 1), d_.view(1, -1, 1, 1, 1)
 
 
 class semi_implicit_solver():
-    def __init__(self, Dw, rho, dx, dt, lamda, mu, gamma, MaxIter, epsilon):
+    def __init__(self, Dw, rho, dx, dt, E, nu, gamma, MaxIter, epsilon):
         self.Dw = Dw
         self.rho = rho
         self.dt = dt
         self.Filter_var, self.Filter_var_d, self.dx, self.d_ = get_diff_operator(dx)
-        self.lamda = torch.tensor(lamda).cuda()
-        self.mu = torch.tensor(mu).cuda()
+        self.E = torch.tensor(E).cuda().view(1, -1, 1, 1, 1)
+        self.nu = torch.tensor(nu).cuda().view(1, -1, 1, 1, 1)
         self.gamma = torch.tensor(gamma).cuda()
         self.MaxIter = MaxIter
         self.epsilon = epsilon
@@ -146,7 +147,7 @@ class semi_implicit_solver():
         x = F.pad(x, (1,1,1,1,1,1), mode='constant')
         x = F.conv3d(x, self.Filter_var, padding=0)
         
-        return torch.mul(x, self.dx.view(1, -1, 1, 1, 1))
+        return torch.mul(x, self.dx)
 
 
     def compute_lap_grad_wo_d(self, x):
@@ -161,7 +162,7 @@ class semi_implicit_solver():
         x = F.pad(x, (1,1,1,1,1,1), mode='constant')
         x = F.conv3d(x, self.Filter_var_d, padding=0)
         
-        return torch.mul(x, self.dx.view(1, -1, 1, 1, 1))
+        return torch.mul(x, self.dx)
 
 
     def compute_grad(self, x):
@@ -176,7 +177,7 @@ class semi_implicit_solver():
         x = F.pad(x, (1,1,1,1,1,1), mode='constant')
         x = F.conv3d(x, self.Filter_var[:3,...], padding=0)
 
-        return torch.mul(x, self.dx[:3].view(1, -1, 1, 1, 1))
+        return torch.mul(x, self.dx[:,:3,...])
 
 
     def compute_lap(self, x, sum_=True):
@@ -192,9 +193,9 @@ class semi_implicit_solver():
         x = F.conv3d(x, self.Filter_var[3:,...], padding=0)
         
         if sum_:
-            return torch.mul(torch.sum(x, 1, keepdim=True), self.dx[3:].view(1, -1, 1, 1, 1))
+            return torch.sum(torch.mul(x, self.dx[:,3:,...]), 1, keepdim=True)
         else:
-            return torch.mul(x, self.dx[3:].view(1, -1, 1, 1, 1))
+            return torch.mul(x, self.dx[:,3:,...])
     
     
     def compute_lap_wo_d(self, x, sum_=True):
@@ -210,9 +211,9 @@ class semi_implicit_solver():
         x = F.conv3d(x, self.Filter_var_d[3:,...], padding=0)
         
         if sum_:
-            return torch.mul(torch.sum(x, 1, keepdim=True), self.dx[3:].view(1, -1, 1, 1, 1))
+            return torch.sum(torch.mul(x, self.dx[:,3:,...]), 1, keepdim=True)
         else:
-            return torch.mul(x, self.dx[3:].view(1, -1, 1, 1, 1))
+            return torch.mul(x, self.dx[:,3:,...])
 
 
     def compute_div(self, x):
@@ -249,6 +250,20 @@ class semi_implicit_solver():
         x.data[:,:,:,:,-1] = 0.0
         
         return x
+    
+    
+    def update_lame_coeff(self, m, c, phi_brain):
+        """[summary]
+
+        Args:
+            m ([type]): [description]
+            c ([type]): [description]
+            phi_brain ([type]): [description]
+        """
+        ls = torch.cat((m, c), 1)
+        # print("ls:", torch.amin(ls), torch.amax(ls))
+        self.lamda = torch.sum(torch.div(torch.mul(self.E*self.nu, ls) , (1.+self.nu)*(1.-2.*self.nu)), 1, keepdim=True) + (1.0-phi_brain)/1e-17
+        self.mu = torch.sum(torch.div(torch.mul(self.E, ls) , 2.*(1. + self.nu)), 1, keepdim=True) + (1.0-phi_brain)/1e-17
 
 
     def precompute_c(self, c, m, v):
@@ -257,9 +272,7 @@ class semi_implicit_solver():
         Args:
             c ([type]): [description]
             m ([type]): [description]
-            u ([type]): [description]
             v ([type]): [description]
-            phi_brain ([type]): [description]
 
         Returns:
             [type]: [description]
@@ -300,9 +313,7 @@ class semi_implicit_solver():
         """[summary]
 
         Args:
-            c ([type]): [description]
             m ([type]): [description]
-            u ([type]): [description]
             v ([type]): [description]
             phi_brain ([type]): [description]
 
@@ -312,14 +323,13 @@ class semi_implicit_solver():
         # get phase field function multiplied by diffusivity
         grad_phi_brain = self.compute_grad(phi_brain)
         
-        grad_phi_brain = torch.norm(grad_phi_brain, 1, keepdim=True)
+        grad_phi_brain = torch.norm(grad_phi_brain, dim=1, keepdim=True)
         
         # divergence of kroneker product
-        mv = torch.cat(((m*v[:,0:1,...]).unsqueeze(2), (m*v[:,1:2,...]).unsqueeze(2), (m*v[:,2:3,...]).unsqueeze(2)), 2)
-        div = torch.cat((self.compute_div(mv[:,0,...]), self.compute_div(mv[:,1,...]), self.compute_div(mv[:,2,...])), 1)
+        div = -torch.cat((self.compute_div(m[:,0:1,...]*v), self.compute_div(m[:,1:2,...]*v), self.compute_div(m[:,2:3,...]*v)), 1)
         
         # boundary condition term
-        bc = torch.mul(m, grad_phi_brain)
+        bc = -torch.mul(m, grad_phi_brain)
         
         # total term irrespective of m_new
         const_m = torch.mul(m, phi_brain) + (1.0 - self.epsilon)*self.dt*(div+bc)
@@ -332,9 +342,10 @@ class semi_implicit_solver():
 
         Args:
             c ([type]): [description]
-            m ([type]): [description]
             v ([type]): [description]
             const_c ([type]): [description]
+            D ([type]): [description]
+            grad_D ([type]): [description]
             phi_tumor ([type]): [description]
             grad_phi_tumor ([type]): [description]
 
@@ -354,12 +365,12 @@ class semi_implicit_solver():
         # boundary condition term
         bc = torch.sum(torch.mul(grad_phi_tumor, D*remain_lap_grad[:,:3,...]), 1, keepdim=True)
         
-        # LHS divider
-        div_c = (1.0 - self.dt*self.epsilon*D*self.d_[3:].sum()).pow_(-1)
+        # denominator for update
+        den_c = (1.0 - self.dt*self.epsilon*D*self.d_[:,3:,...].sum()).pow_(-1)
         
         c = self.dt*(torch.mul(diff+adv, phi_tumor)+bc) + const_c
         
-        c = torch.mul(c, div_c)
+        c = torch.mul(c, den_c)
         c = self.apply_boundary(c)
         
         return c
@@ -379,20 +390,19 @@ class semi_implicit_solver():
             [type]: [description]
         """
         # div of kroneker product
-        grad_vx = self.compute_grad(v[:,0:1,...])
-        grad_vy = self.compute_grad(v[:,1:2,...])
-        grad_vz = self.compute_grad(v[:,2:3,...])
+        grad_mx = self.compute_grad(m[:,0:1,...])
+        grad_my = self.compute_grad(m[:,1:2,...])
+        grad_mz = self.compute_grad(m[:,2:3,...])
         
-        mv = torch.cat(((m*v[:,0:1,...]).unsqueeze(2), (m*v[:,1:2,...]).unsqueeze(2), (m*v[:,2:3,...]).unsqueeze(2)), 2)
-        div = -torch.cat((self.compute_div(mv[:,0,...]), self.compute_div(mv[:,1,...]), self.compute_div(mv[:,2,...])), 1)
-        lhs = torch.cat((grad_vx[:,0:1,...],grad_vy[:,1:2,...],grad_vz[:,2:3,...]),1)
-        div = div + torch.mul(m, lhs)
-        div_m = (1.0 + self.epsilon*self.dt*(lhs + grad_phi_brain)).pow_(-1)
+        div_wo_m = -torch.cat((torch.sum(grad_mx*v, 1, keepdim=True), torch.sum(grad_my*v, 1, keepdim=True), torch.sum(grad_mz*v, 1, keepdim=True)),1)
+        
+        # denominator for update
+        den_m = (1.0 + self.epsilon*self.dt*(self.compute_div(v) + grad_phi_brain)).pow_(-1)
         
         # update m
-        m = self.epsilon*self.dt*(div) + const_m
+        m = self.epsilon*self.dt*(div_wo_m) + const_m
         
-        m = torch.mul(m, div_m)
+        m = torch.mul(m, den_m)
         m = self.apply_boundary(m)
         
         return m
@@ -404,7 +414,6 @@ class semi_implicit_solver():
         Args:
             u ([type]): [description]
             c ([type]): [description]
-            const_u ([type]): [description]
             phi_brain ([type]): [description]
             grad_phi_brain ([type]): [description]
 
@@ -412,21 +421,37 @@ class semi_implicit_solver():
             [type]: [description]
         """
         # laplacian + gradient of divergence
+        lap_ux = self.compute_lap_wo_d(u[:,0:1,...])
+        lap_uy = self.compute_lap_wo_d(u[:,1:2,...])
+        lap_uz = self.compute_lap_wo_d(u[:,2:3,...])
         
-        lap_ux = self.compute_lap_wo_d(u[:,0:1,...], sum_=False)
-        lap_uy = self.compute_lap_wo_d(u[:,1:2,...], sum_=False)
-        lap_uz = self.compute_lap_wo_d(u[:,2:3,...], sum_=False)
+        lap_u = torch.cat((lap_ux, lap_uy, lap_uz), 1)
+        div_lap_ = torch.mul((self.lamda+self.mu), lap_u) +\
+            torch.mul(self.mu, self.compute_grad(self.compute_div(u)))
         
-        lap_u = torch.cat((torch.sum(lap_ux, 1, keepdim=True), torch.sum(lap_uy, 1, keepdim=True), torch.sum(lap_uz, 1, keepdim=True)), 1)
-        lap_gradiv = torch.mul((self.lamda+self.mu).view(1, -1, 1, 1, 1), lap_u)+\
-            torch.mul(self.lamda.view(1, -1, 1, 1, 1), self.compute_grad(self.compute_div(u)))
+        # grad_lamda_mu = self.compute_grad(torch.mul(self.lamda+self.mu, phi_brain))
+        # grad_mu = self.compute_grad(self.mu)
         
-        lap_u_ = torch.cat((lap_ux[:,0:1,...], lap_uy[:,1:2,...], lap_uy[:,2:3,...]), 1)
+        # grad_ux = self.compute_grad(u[:,0:1,...])
+        # grad_uy = self.compute_grad(u[:,1:2,...])
+        # grad_uz = self.compute_grad(u[:,2:3,...])
         
-        u = lap_gradiv - lap_u_
-        div_u = (-((self.lamda+self.mu+1)*self.d_[3:]).view(1, -1, 1, 1, 1)+grad_phi_brain).pow_(-1)
+        # transpose_grad = torch.cat((grad_ux.unsqueeze(2), grad_uy.unsqueeze(2), grad_uz.unsqueeze(2)),2).permute(0,2,1,3,4,5)
         
-        u = torch.mul(u, div_u)
+        # rem_1 = torch.cat((torch.sum(grad_lamda_mu*grad_ux, 1, keepdim=True),
+        #                 torch.sum(grad_lamda_mu*grad_uy, 1, keepdim=True),
+        #                 torch.sum(grad_lamda_mu*grad_uz, 1, keepdim=True)), 1)
+        
+        # rem_2 = torch.cat((torch.sum(grad_mu*transpose_grad[:,0,...], 1, keepdim=True),
+        #                 torch.sum(grad_mu*transpose_grad[:,1,...], 1, keepdim=True),
+        #                 torch.sum(grad_mu*transpose_grad[:,2,...], 1, keepdim=True)), 1)
+        
+        u = -div_lap_ + self.gamma*self.compute_grad(c) #torch.mul(-div_lap_ +  - rem_1  - rem_2 + u*self.d_[:,3:,...] 
+        
+        # denominator for update
+        den_u = ((self.lamda+self.mu)*self.d_[:,3:,...].sum()+grad_phi_brain+self.mu*self.d_[:,3:,...]).pow_(-1)
+        
+        u = torch.mul(u, den_u)
         u = self.apply_boundary(u)
         
         return u
@@ -440,36 +465,41 @@ class semi_implicit_solver():
             m ([type]): [description]
             u ([type]): [description]
             v ([type]): [description]
+            phi_brain ([type]): [description]
 
         Returns:
             [type]: [description]
         """
-        
         # limit value between [0, 1]
         c = c.clamp(min=0.0, max=1.0)
-        c_init = c
-        m_init = m
-        u_init = u
+        c_init = copy.deepcopy(c)
+        m_init = copy.deepcopy(m)
+        u_init = copy.deepcopy(u)
+        # print('M:', torch.amin(m),torch.amax(m))
 
         #redoing everything to properly time it
-        const_m, grad_phi_brain = self.precompute_m(m, v, phi_brain)
+        const_m, grad_phi_brain = self.precompute_m(m_init, v, phi_brain)
 
         for iter_ in range(self.MaxIter):
+            
+            self.update_lame_coeff(m, c, phi_brain)
 
-            # # compute the update of u
-            # u = self.update_u(u, c, phi_brain, grad_phi_brain)
+            # compute the update of u
+            # for _ in range(1):
+            #     u = self.update_u(u, c, phi_brain, grad_phi_brain)
             # v = (u-u_init)/self.dt
+            # print('U:', torch.amin(u),torch.amax(u))
             # print('V:', torch.amin(v),torch.amax(v))
             
-            # # compute the update of m
-            # m = self.update_m(m, v, const_m, phi_brain, grad_phi_brain)
-            # m = torch.multiply(m.clamp(min=0, max=1), phi_brain) # TODO: check sum of m
+            # compute the update of m
+            m = self.update_m(m, v, const_m, phi_brain, grad_phi_brain)
             # print('M:', torch.amin(m),torch.amax(m))
+            m = torch.multiply(m.clamp(min=0, max=1), phi_brain) # TODO: check sum of m
             
             # compute the update of c
-            const_c, D, grad_D, phi_tumor, grad_phi_tumor = self.precompute_c(c_init, m, v)
-            c = self.update_c(c, v, const_c, D, grad_D, phi_tumor, grad_phi_tumor)
-            # print(torch.amin(c),torch.amax(c))
-            c = c.clamp(min=0.0, max=1.0)
-
+            # const_c, D, grad_D, phi_tumor, grad_phi_tumor = self.precompute_c(c_init, m, v)
+            # c = self.update_c(c, v, const_c, D, grad_D, phi_tumor, grad_phi_tumor)
+            # # print("C:",torch.amin(c),torch.amax(c))
+            # c = c.clamp(min=0.0, max=1.0)
+            
         return c, m, u, v
