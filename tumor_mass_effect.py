@@ -262,8 +262,8 @@ class semi_implicit_solver():
         """
         ls = torch.cat((m, c), 1)
         # print("ls:", torch.amin(ls), torch.amax(ls))
-        self.lamda = torch.sum(torch.div(torch.mul(self.E*self.nu, ls) , (1.+self.nu)*(1.-2.*self.nu)), 1, keepdim=True) + (1.0-phi_brain)/1e-17
-        self.mu = torch.sum(torch.div(torch.mul(self.E, ls) , 2.*(1. + self.nu)), 1, keepdim=True) + (1.0-phi_brain)/1e-17
+        self.lamda = torch.sum(torch.div(torch.mul(self.E*self.nu, ls) , (1.+self.nu)*(1.-2.*self.nu)), 1, keepdim=True) + (1.0-phi_brain)/1e-4
+        self.mu = torch.sum(torch.div(torch.mul(self.E, ls) , 2.*(1. + self.nu)), 1, keepdim=True) + (1.0-phi_brain)/1e-4
 
 
     def precompute_c(self, c, m, v):
@@ -332,7 +332,7 @@ class semi_implicit_solver():
         bc = -torch.mul(m, grad_phi_brain)
         
         # total term irrespective of m_new
-        const_m = torch.mul(m, phi_brain) + (1.0 - self.epsilon)*self.dt*(div+bc)
+        const_m = m + (1.0 - self.epsilon)*self.dt*(div)
         
         return const_m, grad_phi_brain
 
@@ -376,7 +376,7 @@ class semi_implicit_solver():
         return c
 
 
-    def update_m(self, m, v, const_m, phi_brain, grad_phi_brain):
+    def update_m(self, m, v, const_m, phi_brain, m_init):
         """[summary]
 
         Args:
@@ -397,14 +397,14 @@ class semi_implicit_solver():
         div_wo_m = -torch.cat((torch.sum(grad_mx*v, 1, keepdim=True), torch.sum(grad_my*v, 1, keepdim=True), torch.sum(grad_mz*v, 1, keepdim=True)),1)
         
         # denominator for update
-        den_m = (1.0 + self.epsilon*self.dt*(self.compute_div(v) + grad_phi_brain)).pow_(-1)
+        den_m = (1.0 + self.epsilon*self.dt*(self.compute_div(v) )).pow_(-1)
         
         # update m
         m = self.epsilon*self.dt*(div_wo_m) + const_m
         
         m = torch.mul(m, den_m)
         m = self.apply_boundary(m)
-        
+        m = torch.mul(m, phi_brain)+torch.mul(1-phi_brain, m_init)
         return m
 
 
@@ -429,35 +429,19 @@ class semi_implicit_solver():
         div_lap_ = torch.mul((self.lamda+self.mu), lap_u) +\
             torch.mul(self.mu, self.compute_grad(self.compute_div(u)))
         
-        # grad_lamda_mu = self.compute_grad(torch.mul(self.lamda+self.mu, phi_brain))
-        # grad_mu = self.compute_grad(self.mu)
-        
-        # grad_ux = self.compute_grad(u[:,0:1,...])
-        # grad_uy = self.compute_grad(u[:,1:2,...])
-        # grad_uz = self.compute_grad(u[:,2:3,...])
-        
-        # transpose_grad = torch.cat((grad_ux.unsqueeze(2), grad_uy.unsqueeze(2), grad_uz.unsqueeze(2)),2).permute(0,2,1,3,4,5)
-        
-        # rem_1 = torch.cat((torch.sum(grad_lamda_mu*grad_ux, 1, keepdim=True),
-        #                 torch.sum(grad_lamda_mu*grad_uy, 1, keepdim=True),
-        #                 torch.sum(grad_lamda_mu*grad_uz, 1, keepdim=True)), 1)
-        
-        # rem_2 = torch.cat((torch.sum(grad_mu*transpose_grad[:,0,...], 1, keepdim=True),
-        #                 torch.sum(grad_mu*transpose_grad[:,1,...], 1, keepdim=True),
-        #                 torch.sum(grad_mu*transpose_grad[:,2,...], 1, keepdim=True)), 1)
-        
-        u = -div_lap_ + self.gamma*self.compute_grad(c) #torch.mul(-div_lap_ +  - rem_1  - rem_2 + u*self.d_[:,3:,...] 
+        u = -div_lap_ + self.gamma*self.compute_grad(c) + self.mu*u*self.d_[:,3:,...]  
         
         # denominator for update
-        den_u = ((self.lamda+self.mu)*self.d_[:,3:,...].sum()+grad_phi_brain+self.mu*self.d_[:,3:,...]).pow_(-1)
+        den_u = ((self.lamda+self.mu)*self.d_[:,3:,...].sum()+self.mu*self.d_[:,3:,...]).pow_(-1)
         
         u = torch.mul(u, den_u)
         u = self.apply_boundary(u)
+        # u = torch.mul(u, phi_brain>0.9)
         
         return u
 
 
-    def solver_step(self, c, m, u, v, phi_brain):
+    def solver_step(self, c, m, u, v, m_0):
         """[summary]
 
         Args:
@@ -470,6 +454,7 @@ class semi_implicit_solver():
         Returns:
             [type]: [description]
         """
+        phi_brain = torch.sum(m_0, 1, keepdim=True)
         # limit value between [0, 1]
         c = c.clamp(min=0.0, max=1.0)
         c_init = copy.deepcopy(c)
@@ -485,21 +470,21 @@ class semi_implicit_solver():
             self.update_lame_coeff(m, c, phi_brain)
 
             # compute the update of u
-            # for _ in range(1):
-            #     u = self.update_u(u, c, phi_brain, grad_phi_brain)
-            # v = (u-u_init)/self.dt
+            for _ in range(1):
+                u = self.update_u(u, c, phi_brain, grad_phi_brain)
+            v = (u-u_init)/self.dt
             # print('U:', torch.amin(u),torch.amax(u))
             # print('V:', torch.amin(v),torch.amax(v))
             
             # compute the update of m
-            m = self.update_m(m, v, const_m, phi_brain, grad_phi_brain)
+            m = self.update_m(m, v, const_m, phi_brain, m_0)
             # print('M:', torch.amin(m),torch.amax(m))
-            m = torch.multiply(m.clamp(min=0, max=1), phi_brain) # TODO: check sum of m
+            m = m.clamp(min=0, max=1) # TODO: check sum of m
             
             # compute the update of c
-            # const_c, D, grad_D, phi_tumor, grad_phi_tumor = self.precompute_c(c_init, m, v)
-            # c = self.update_c(c, v, const_c, D, grad_D, phi_tumor, grad_phi_tumor)
-            # # print("C:",torch.amin(c),torch.amax(c))
-            # c = c.clamp(min=0.0, max=1.0)
+            const_c, D, grad_D, phi_tumor, grad_phi_tumor = self.precompute_c(c_init, m, v)
+            c = self.update_c(c, v, const_c, D, grad_D, phi_tumor, grad_phi_tumor)
+            # print("C:",torch.amin(c),torch.amax(c))
+            c = c.clamp(min=0.0, max=1.0)
             
         return c, m, u, v
