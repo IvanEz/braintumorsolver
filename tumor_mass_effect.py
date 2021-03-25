@@ -10,7 +10,6 @@ from torch import nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-
 # ## Auxiliary functions
 def get_diff_operator(dx):
     """[summary]
@@ -262,8 +261,8 @@ class semi_implicit_solver():
         """
         ls = torch.cat((m, c), 1)
         # print("ls:", torch.amin(ls), torch.amax(ls))
-        self.lamda = torch.sum(torch.div(torch.mul(self.E*self.nu, ls) , (1.+self.nu)*(1.-2.*self.nu)), 1, keepdim=True) + (1.0-phi_brain)/1e-4
-        self.mu = torch.sum(torch.div(torch.mul(self.E, ls) , 2.*(1. + self.nu)), 1, keepdim=True) + (1.0-phi_brain)/1e-4
+        self.lamda = torch.sum(torch.div(torch.mul(self.E*self.nu, ls) , (1.+self.nu)*(1.-2.*self.nu)), 1, keepdim=True) #+ (1.0-phi_brain)/1e-17
+        self.mu = torch.sum(torch.div(torch.mul(self.E, ls) , 2.*(1. + self.nu)), 1, keepdim=True) #+ (1.0-phi_brain)/1e-17
 
 
     def precompute_c(self, c, m, v):
@@ -279,7 +278,7 @@ class semi_implicit_solver():
         """
         # soft domain from white and grey matter probabilities
         pw, pg = m[:,0:1,...], m[:,1:2,...]
-        phi_tumor = pw + pg
+        phi_tumor = (pw + pg).clamp(min=0, max=1.0)
         
         # get phase field function multiplied by diffusivity
         grad_phi_tumor = self.compute_grad(phi_tumor)
@@ -372,11 +371,12 @@ class semi_implicit_solver():
         
         c = torch.mul(c, den_c)
         c = self.apply_boundary(c)
+        c = c.clamp(min=0.0, max=1.0)
         
         return c
 
 
-    def update_m(self, m, v, const_m, phi_brain, m_init):
+    def update_m(self, m, v, c, const_m, phi_brain, m_init):
         """[summary]
 
         Args:
@@ -390,21 +390,25 @@ class semi_implicit_solver():
             [type]: [description]
         """
         # div of kroneker product
-        grad_mx = self.compute_grad(m[:,0:1,...])
-        grad_my = self.compute_grad(m[:,1:2,...])
-        grad_mz = self.compute_grad(m[:,2:3,...])
+        grad_mw = self.compute_grad(m[:,0:1,...])
+        grad_mg = self.compute_grad(m[:,1:2,...])
+        grad_mc = self.compute_grad(m[:,2:3,...])
         
-        div_wo_m = -torch.cat((torch.sum(grad_mx*v, 1, keepdim=True), torch.sum(grad_my*v, 1, keepdim=True), torch.sum(grad_mz*v, 1, keepdim=True)),1)
+        div_wo_m = -torch.cat((torch.sum(grad_mw*v, 1, keepdim=True), torch.sum(grad_mg*v, 1, keepdim=True), torch.sum(grad_mc*v, 1, keepdim=True)),1)
         
         # denominator for update
-        den_m = (1.0 + self.epsilon*self.dt*(self.compute_div(v) )).pow_(-1)
+        den_m = (1.0 + self.epsilon*self.dt*(self.compute_div(v))).pow_(-1)
         
         # update m
         m = self.epsilon*self.dt*(div_wo_m) + const_m
         
         m = torch.mul(m, den_m)
-        m = self.apply_boundary(m)
-        m = torch.mul(m, phi_brain)+torch.mul(1-phi_brain, m_init)
+        m = m.clamp(min=0, max=2.0) # TODO: check sum of m for feasible tissue probability
+        m = F.normalize(self.apply_boundary(m), p=1, dim=1) #, (1.-c))
+        m[torch.isnan(m)] = 0.0
+        m = torch.mul(m, phi_brain)+torch.mul(1.-phi_brain, m_init)
+        # TODO: Neuman boundary condition?
+        
         return m
 
 
@@ -420,6 +424,7 @@ class semi_implicit_solver():
         Returns:
             [type]: [description]
         """
+        # mask = phi_brain>0.9
         # laplacian + gradient of divergence
         lap_ux = self.compute_lap_wo_d(u[:,0:1,...])
         lap_uy = self.compute_lap_wo_d(u[:,1:2,...])
@@ -436,12 +441,15 @@ class semi_implicit_solver():
         
         u = torch.mul(u, den_u)
         u = self.apply_boundary(u)
-        # u = torch.mul(u, phi_brain>0.9)
+        
+        # TODO: Is this clamping needed for boundary?
+        u = torch.mul(u, phi_brain>0.9)
+        u[torch.isnan(u)] = 0.0
         
         return u
 
 
-    def solver_step(self, c, m, u, v, m_0):
+    def solver_step(self, c, m, u, v, phi_brain, m_0):
         """[summary]
 
         Args:
@@ -454,7 +462,6 @@ class semi_implicit_solver():
         Returns:
             [type]: [description]
         """
-        phi_brain = torch.sum(m_0, 1, keepdim=True)
         # limit value between [0, 1]
         c = c.clamp(min=0.0, max=1.0)
         c_init = copy.deepcopy(c)
@@ -462,29 +469,30 @@ class semi_implicit_solver():
         u_init = copy.deepcopy(u)
         # print('M:', torch.amin(m),torch.amax(m))
 
-        #redoing everything to properly time it
+        # redoing everything to properly time it
         const_m, grad_phi_brain = self.precompute_m(m_init, v, phi_brain)
+        const_c, D, grad_D, phi_tumor, grad_phi_tumor = self.precompute_c(c_init, m_init, v)
 
         for iter_ in range(self.MaxIter):
             
             self.update_lame_coeff(m, c, phi_brain)
 
             # compute the update of u
-            for _ in range(1):
+            for _ in range(5):
                 u = self.update_u(u, c, phi_brain, grad_phi_brain)
             v = (u-u_init)/self.dt
+            v = v.clamp(min=-5e-4, max=5e-4)  # TODO: check maximum feasible velocity for clamping
             # print('U:', torch.amin(u),torch.amax(u))
             # print('V:', torch.amin(v),torch.amax(v))
             
             # compute the update of m
-            m = self.update_m(m, v, const_m, phi_brain, m_0)
+            for _ in range(5):
+                m = self.update_m(m, v, c, const_m, phi_brain, m_0)
             # print('M:', torch.amin(m),torch.amax(m))
-            m = m.clamp(min=0, max=1) # TODO: check sum of m
             
             # compute the update of c
-            const_c, D, grad_D, phi_tumor, grad_phi_tumor = self.precompute_c(c_init, m, v)
-            c = self.update_c(c, v, const_c, D, grad_D, phi_tumor, grad_phi_tumor)
+            for _ in range(5):
+                c = self.update_c(c, v, const_c, D, grad_D, phi_tumor, grad_phi_tumor)
             # print("C:",torch.amin(c),torch.amax(c))
-            c = c.clamp(min=0.0, max=1.0)
             
         return c, m, u, v
