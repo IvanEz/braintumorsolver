@@ -449,7 +449,7 @@ class semi_implicit_solver():
         return u
 
 
-    def solver_step(self, c, m, u, v, phi_brain, m_0):
+    def solver_step(self, c, m, u, v, phi_brain, m_0, iter_=2):
         """[summary]
 
         Args:
@@ -473,12 +473,12 @@ class semi_implicit_solver():
         const_m, grad_phi_brain = self.precompute_m(m_init, v, phi_brain)
         const_c, D, grad_D, phi_tumor, grad_phi_tumor = self.precompute_c(c_init, m_init, v)
 
-        for iter_ in range(self.MaxIter):
+        for _ in range(self.MaxIter):
             
             self.update_lame_coeff(m, c, phi_brain)
 
             # compute the update of u
-            for _ in range(5):
+            for _ in range(iter_):
                 u = self.update_u(u, c, phi_brain, grad_phi_brain)
             v = (u-u_init)/self.dt
             v = v.clamp(min=-5e-4, max=5e-4)  # TODO: check maximum feasible velocity for clamping
@@ -486,12 +486,12 @@ class semi_implicit_solver():
             # print('V:', torch.amin(v),torch.amax(v))
             
             # compute the update of m
-            for _ in range(5):
+            for _ in range(iter_):
                 m = self.update_m(m, v, c, const_m, phi_brain, m_0)
             # print('M:', torch.amin(m),torch.amax(m))
             
             # compute the update of c
-            for _ in range(5):
+            for _ in range(iter_):
                 c = self.update_c(c, v, const_c, D, grad_D, phi_tumor, grad_phi_tumor)
             # print("C:",torch.amin(c),torch.amax(c))
             
